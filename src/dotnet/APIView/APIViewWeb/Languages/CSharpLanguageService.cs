@@ -1,20 +1,34 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 using ApiView;
+using Microsoft.ApplicationInsights;
+using Microsoft.Extensions.Configuration;
 
 namespace APIViewWeb
 {
-    public class CSharpLanguageService : LanguageService
+    public class CSharpLanguageService : LanguageProcessor
     {
-        private static Regex _packageNameParser = new Regex("([A-Za-z.]*[a-z]).([\\S]*)", RegexOptions.Compiled);
+        private readonly string _csharpParserToolPath;
         public override string Name { get; } = "C#";
-        public override string Extension { get; } = ".dll";
+        public override string[] Extensions { get; } = { ".dll" };
+        public override string ProcessName => _csharpParserToolPath;
+        public override string VersionString { get; } = "29.1";
+
+        public CSharpLanguageService(IConfiguration configuration, TelemetryClient telemetryClient) : base(telemetryClient)
+        {
+            _csharpParserToolPath = configuration["CSHARPPARSEREXECUTABLEPATH"];
+        }
+
+        public override string GetProcessorArguments(string originalName, string tempDirectory, string jsonPath)
+        {
+            var outputFileName = Path.GetFileName(jsonPath).Replace(".json", "");
+            return $"--packageFilePath \"{originalName}\" --outputDirectoryPath \"{tempDirectory}\" --outputFileName \"{outputFileName}\"";
+        }
 
         public override bool IsSupportedFile(string name)
         {
@@ -33,71 +47,7 @@ namespace APIViewWeb
 
         public override bool CanUpdate(string versionString)
         {
-            return versionString != CodeFileBuilder.CurrentVersion;
-        }
-
-        public override Task<CodeFile> GetCodeFileAsync(string originalName, Stream stream, bool runAnalysis)
-        {
-            ZipArchive archive = null;
-            try
-            {
-                Stream dllStream = stream;
-                Stream docStream = null;
-
-                if (IsNuget(originalName))
-                {
-                    archive = new ZipArchive(stream, ZipArchiveMode.Read, true);
-                    foreach (var entry in archive.Entries)
-                    {
-                        if (IsDll(entry.Name))
-                        {
-                            dllStream = entry.Open();
-                            var docEntry = archive.GetEntry(Path.ChangeExtension(entry.FullName, ".xml"));
-                            if (docEntry != null)
-                            {
-                                docStream = docEntry.Open();
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                var assemblySymbol = CompilationFactory.GetCompilation(dllStream, docStream);
-                if ( assemblySymbol == null)
-                {
-                    return Task.FromResult(GetDummyReviewCodeFile(originalName));
-                }
-                
-                return Task.FromResult(new CodeFileBuilder().Build(assemblySymbol, runAnalysis));
-            }
-            finally
-            {
-                archive?.Dispose();
-            }
-        }
-
-        private CodeFile GetDummyReviewCodeFile(string originalName)
-        {
-            var packageName = Path.GetFileNameWithoutExtension(originalName);
-            var reviewName = "";
-            var packageNameMatch = _packageNameParser.Match(packageName);
-            if (packageNameMatch.Success)
-            {
-                packageName = packageNameMatch.Groups[1].Value;
-                reviewName = $"{packageName} ({packageNameMatch.Groups[2].Value})";
-            }
-            else
-            {
-                reviewName = $"{packageName} (metapackage)";
-            }
-
-            return new CodeFile()
-            {                
-                Name = reviewName,
-                Language = "C#",
-                VersionString = CodeFileBuilder.CurrentVersion,
-                PackageName = packageName
-            };
+            return versionString != VersionString;
         }
     }
 }

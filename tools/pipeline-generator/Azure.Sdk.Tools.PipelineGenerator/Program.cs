@@ -1,7 +1,3 @@
-﻿using McMaster.Extensions.CommandLineUtils;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using PipelineGenerator.Conventions;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -9,23 +5,67 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using CommandLine;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using PipelineGenerator.Conventions;
+using PipelineGenerator.CommandParserOptions;
 
 namespace PipelineGenerator
 {
     public class Program
     {
-
-        public static int Main(string[] args)
+        public static async Task Main(string[] args)
         {
-
             var cancellationTokenSource = new CancellationTokenSource();
             Console.CancelKeyPress += (sender, e) =>
             {
                 cancellationTokenSource.Cancel();
             };
 
-            var app = PrepareApplication(cancellationTokenSource);
-            return app.Execute(args);
+            await Parser.Default
+                .ParseArguments<DefaultOptions, GenerateOptions>(args)
+                .WithNotParsed(_ => { Environment.Exit((int)ExitCondition.InvalidArguments); })
+                .WithParsedAsync(async o => { await Run(o, cancellationTokenSource); });
+        }
+
+        public static async Task Run(object commandObj, CancellationTokenSource cancellationTokenSource)
+        {
+            ExitCondition code = ExitCondition.Exception;
+
+            switch (commandObj)
+            {
+                case GenerateOptions g:
+                    var serviceProvider = GetServiceProvider(g.Debug);
+                    var program = serviceProvider.GetService<Program>();
+                    code = await program.RunAsync(
+                        g.Organization,
+                        g.Project,
+                        g.Prefix,
+                        g.Path,
+                        g.Endpoint,
+                        g.Repository,
+                        g.Branch,
+                        g.Agentpool,
+                        g.Convention,
+                        g.VariableGroups.ToArray(),
+                        g.DevOpsPath,
+                        g.WhatIf,
+                        g.Open,
+                        g.Destroy,
+                        g.NoSchedule,
+                        g.SetManagedVariables,
+                        g.OverwriteTriggers,
+                        cancellationTokenSource.Token
+                    );
+
+                    break;
+                default:
+                    code = ExitCondition.InvalidArguments;
+                    break;
+            }
+
+            Environment.Exit((int)code);
         }
 
         private static IServiceProvider GetServiceProvider(bool debug)
@@ -38,58 +78,6 @@ namespace PipelineGenerator
                 .AddTransient<IntegrationTestingPipelineConvention>();
 
             return serviceCollection.BuildServiceProvider();
-        }
-
-        private static CommandLineApplication PrepareApplication(CancellationTokenSource cancellationTokenSource)
-        {
-            var app = new CommandLineApplication();
-            app.HelpOption();
-            var organizationOption = app.Option("--organization <url>", "The URL of the Azure DevOps organization.", CommandOptionType.SingleValue).IsRequired();
-            var projectOption = app.Option("--project <project>", "The name of the Azure DevOps project.", CommandOptionType.SingleValue).IsRequired();
-            var prefixOption = app.Option("--prefix <prefix>", "The prefix to append to the pipeline name.", CommandOptionType.SingleValue).IsRequired();
-            var pathOption = app.Option("--path <path>", "The directory from which to scan for components", CommandOptionType.SingleValue).IsRequired();
-            var devOpsPathOption = app.Option("--devopspath <path>", "The DevOps directory for created pipelines", CommandOptionType.SingleValue);
-            var patvarOption = app.Option("--patvar <env>", "Name of an environment variable which contains a PAT.", CommandOptionType.SingleValue).IsRequired();
-            var endpointOption = app.Option("--endpoint <endpoint>", "Name of the service endpoint to configure repositories with.", CommandOptionType.SingleValue).IsRequired();
-            var repositoryOption = app.Option("--repository <repository>", "Name of the GitHub repo in the form [org]/[repo].", CommandOptionType.SingleValue).IsRequired();
-            var branchOption = app.Option("--branch <branch>", "Typically refs/heads/main.", CommandOptionType.SingleValue).IsRequired();
-            var agentpoolOption = app.Option("--agentpool <agentpool>", "Name of the agent pool to use when pool isn't specified.", CommandOptionType.SingleValue).IsRequired();
-            var conventionOption = app.Option("--convention <convention>", "What convention are you building pipelines for?", CommandOptionType.SingleValue).IsRequired();
-            var variablegroupsOption = app.Option("--variablegroup <variablegroup>", "Variable groups. May specify multiple (e.g. --variablegroup 1 --variablegroup 2)", CommandOptionType.MultipleValue);
-            var whatifOption = app.Option("--whatif", "Use this to understand what will happen, but don't change anything.", CommandOptionType.NoValue);
-            var openOption = app.Option("--open", "Open a browser window to the definitions that are created.", CommandOptionType.NoValue);
-            var destroyOption = app.Option("--destroy", "Use this switch to delete the pipelines instead (DANGER!)", CommandOptionType.NoValue);
-            var debugOption = app.Option("--debug", "Turn on debug level logging.", CommandOptionType.NoValue);
-            var noScheduleOption = app.Option("--no-schedule", "Don't create any scheduled triggers.", CommandOptionType.NoValue);
-
-            app.OnExecute(() =>
-            {
-                var serviceProvider = GetServiceProvider(debugOption.HasValue());
-                var program = serviceProvider.GetService<Program>();
-                var exitCondition = program.RunAsync(
-                    organizationOption.Value(),
-                    projectOption.Value(),
-                    prefixOption.Value(),
-                    pathOption.Value(),
-                    patvarOption.Value(),
-                    endpointOption.Value(),
-                    repositoryOption.Value(),
-                    branchOption.Value(),
-                    agentpoolOption.Value(),
-                    conventionOption.Value(),
-                    variablegroupsOption.Values.ToArray(),
-                    devOpsPathOption.Value(),
-                    whatifOption.HasValue(),
-                    openOption.HasValue(),
-                    destroyOption.HasValue(),
-                    noScheduleOption.HasValue(),
-                    cancellationTokenSource.Token
-                    ).Result;
-
-                return (int)exitCondition;
-            });
-
-            return app;
         }
 
         public Program(IServiceProvider serviceProvider, ILogger<Program> logger)
@@ -117,11 +105,15 @@ namespace PipelineGenerator
                     var upLogger = serviceProvider.GetService<ILogger<UnifiedPipelineConvention>>();
                     return new UnifiedPipelineConvention(upLogger, context);
 
+                case "upweekly":
+                    var upWeeklyTestLogger = serviceProvider.GetService<ILogger<WeeklyUnifiedPipelineConvention>>();
+                    return new WeeklyUnifiedPipelineConvention(upWeeklyTestLogger, context);
+
                 case "tests":
                     var testLogger = serviceProvider.GetService<ILogger<IntegrationTestingPipelineConvention>>();
                     return new IntegrationTestingPipelineConvention(testLogger, context);
 
-                case "weekly":
+                case "testsweekly":
                     var weeklyTestLogger = serviceProvider.GetService<ILogger<WeeklyIntegrationTestingPipelineConvention>>();
                     return new WeeklyIntegrationTestingPipelineConvention(weeklyTestLogger, context);
 
@@ -134,18 +126,19 @@ namespace PipelineGenerator
             string project,
             string prefix,
             string path,
-            string patvar,
             string endpoint,
             string repository,
             string branch,
             string agentPool,
             string convention,
-            string[] variableGroups,
+            int[] variableGroups,
             string devOpsPath,
             bool whatIf,
             bool open,
             bool destroy,
             bool noSchedule,
+            bool setManagedVariables,
+            bool overwriteTriggers,
             CancellationToken cancellationToken)
         {
             try
@@ -156,9 +149,9 @@ namespace PipelineGenerator
                 var devOpsPathValue = string.IsNullOrEmpty(devOpsPath) ? $"\\{prefix}" : devOpsPath;
 
                 var context = new PipelineGenerationContext(
+                    this.logger,
                     organization,
                     project,
-                    patvar,
                     endpoint,
                     repository,
                     branch,
@@ -167,7 +160,9 @@ namespace PipelineGenerator
                     devOpsPathValue,
                     prefix,
                     whatIf,
-                    noSchedule
+                    noSchedule,
+                    setManagedVariables,
+                    overwriteTriggers
                     );
 
                 var pipelineConvention = GetPipelineConvention(convention, context);
@@ -180,6 +175,12 @@ namespace PipelineGenerator
                 }
 
                 logger.LogInformation("Found {0} components", components.Count());
+
+                if (HasPipelineDefinitionNameDuplicates(pipelineConvention, components))
+                {
+                    return ExitCondition.DuplicateComponentsFound;
+                }
+
                 foreach (var component in components)
                 {
                     logger.LogInformation("Processing component '{0}' in '{1}'.", component.Name, component.Path);
@@ -235,6 +236,37 @@ namespace PipelineGenerator
             var scanDirectory = new DirectoryInfo(path);
             var components = scanner.Scan(scanDirectory, searchPattern);
             return components;
+        }
+
+        private bool HasPipelineDefinitionNameDuplicates(PipelineConvention convention, IEnumerable<SdkComponent> components)
+        {
+            var pipelineNames = new Dictionary<string, SdkComponent>();
+            var duplicates = new HashSet<SdkComponent>();
+
+            foreach (var component in components)
+            {
+                var definitionName = convention.GetDefinitionName(component);
+                if (pipelineNames.TryGetValue(definitionName, out var duplicate))
+                {
+                    duplicates.Add(duplicate);
+                    duplicates.Add(component);
+                }
+                else
+                {
+                    pipelineNames.Add(definitionName, component);
+                }
+            }
+
+            if (duplicates.Count > 0) {
+                logger.LogError("Found multiple pipeline definitions that will result in name collisions. This can happen when nested directory names are the same.");
+                logger.LogError("Suggested fix: add a 'variant' to the yaml filename, e.g. 'sdk/keyvault/internal/ci.yml' => 'sdk/keyvault/internal/ci.keyvault.yml'");
+                var paths = duplicates.Select(d => $"'{d.RelativeYamlPath}'");
+                logger.LogError($"Pipeline definitions affected: {String.Join(", ", paths)}");
+
+                return true;
+            }
+
+            return false;
         }
     }
 }

@@ -61,7 +61,7 @@ namespace Stress.Watcher.Tests
         [Fact]
         public void TestShouldStartChaos()
         {
-            var handler = new PodEventHandler(null, null);
+            var handler = new PodEventHandler(null, null, null);
             var pod = CreatePod("testns", "pod-test-instance");
 
             var noStart1 = CreateChaosResource("testnostart1", "test-no-start-1", false);
@@ -77,7 +77,7 @@ namespace Stress.Watcher.Tests
         [Fact]
         public void TestShouldStartPodChaos()
         {
-            var handler = new PodEventHandler(null, null);
+            var handler = new PodEventHandler(null, null, null);
             var pod = CreatePod("testns", "pod-test-instance");
 
             pod.Status.Phase = "Pending";

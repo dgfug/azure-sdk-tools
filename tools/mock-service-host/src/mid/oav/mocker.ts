@@ -1,10 +1,12 @@
 import * as mockjs from 'mockjs'
 import { logger } from '../../common/utils'
+import { mockedResourceType } from '../../common/constants'
+
 export default class Mocker {
-    public mock(paramSpec: any, paramName: string, arrItem?: any): any {
+    public mock(paramSpec: any, paramName: string, arrItem?: any, inAzureResource = false): any {
         switch (paramSpec.type) {
             case 'string':
-                return this.generateString(paramSpec, paramName)
+                return this.generateString(paramSpec, paramName, inAzureResource)
             case 'integer':
                 return this.generateInteger(paramSpec)
             case 'number':
@@ -18,13 +20,21 @@ export default class Mocker {
         }
     }
 
-    private generateString(paramSpec: any, paramName: string) {
+    private generateString(paramSpec: any, paramName: string, inAzureResource: boolean) {
         if (paramSpec.format === 'date') {
             return new Date().toISOString().split('T')[0]
         }
 
         if (paramSpec.format === 'date-time') {
             return new Date().toISOString()
+        }
+
+        if (paramSpec.format === 'date-time-rfc1123') {
+            return new Date().toUTCString()
+        }
+
+        if (paramSpec.format === 'duration') {
+            return 'PT72H'
         }
 
         if ('enum' in paramSpec) {
@@ -39,17 +49,29 @@ export default class Mocker {
         // If the mocked value fails to meet the constraints, error info will be logged and empty string will return.
         if ('pattern' in paramSpec) {
             const Mock = mockjs
-            return this.mockForPattern(
-                Mock,
-                paramSpec.pattern,
-                paramSpec.minLength,
-                paramSpec.maxLength,
-                paramName
-            )
+            try {
+                return this.mockForPattern(
+                    Mock,
+                    paramSpec.pattern,
+                    paramSpec.minLength,
+                    paramSpec.maxLength,
+                    paramName
+                )
+            } catch (e) {
+                logger.warn(
+                    `pattern ${paramSpec.pattern} is too complex to mock, draw back to normal string mock. Error: ${e}`
+                )
+            }
         }
 
-        if (paramName === 'id') {
-            return '/subscriptions/a9cbceed-cd54-47f1-b7a2-bad149218603/resourceGroups/mockRg/providers/Microsoft.Resources/mockResource/mockName'
+        if (inAzureResource) {
+            if (paramName === 'id') {
+                return `/subscriptions/a9cbceed-cd54-47f1-b7a2-bad149218603/resourceGroups/mockRg/providers/${mockedResourceType}/mockName`
+            } else if (paramName === 'name') {
+                return 'mockName'
+            } else if (paramName === 'type') {
+                return mockedResourceType
+            }
         }
 
         if (
@@ -62,9 +84,12 @@ export default class Mocker {
         const length = this.getRandomInt(minLength, maxLength)
 
         const ret = 'a'.repeat(length)
-        if (paramSpec.format === 'byte') {
+        if (['byte', 'base64'].indexOf(paramSpec.format) >= 0) {
             const buff = Buffer.from(ret, 'utf-8')
             return buff.toString('base64')
+        } else if (paramSpec.format === 'base64url') {
+            const buff = Buffer.from(ret, 'utf-8')
+            return buff.toString('base64url')
         }
         return ret
     }

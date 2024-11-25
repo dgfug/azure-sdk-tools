@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using System;
@@ -6,65 +6,76 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 using ApiView;
+using APIViewWeb.Helpers;
+using Microsoft.ApplicationInsights;
 using Microsoft.Extensions.Configuration;
 
 namespace APIViewWeb
 {
     public class PythonLanguageService : LanguageProcessor
     {
-        public override string Name { get; } = "Python";
-        public override string Extension { get; } = ".whl";
-        public override string VersionString { get; } = "0.2.4";
-
         private readonly string _pythonExecutablePath;
+        private readonly TelemetryClient _telemetryClient;
+        public override string Name { get; } = "Python";
+        public override string[] Extensions { get; } = { ".whl" };
+        public override string VersionString { get; } = "0.3.12";
         public override string ProcessName => _pythonExecutablePath;
-        private readonly string _apiScriptPath;
 
-        public PythonLanguageService(IConfiguration configuration)
+        public PythonLanguageService(IConfiguration configuration, TelemetryClient telemetryClient) : base(telemetryClient)
         {
             _pythonExecutablePath = configuration["PYTHONEXECUTABLEPATH"] ?? "python";
-            _apiScriptPath = Path.Combine(Path.GetDirectoryName(typeof(PythonLanguageService).Assembly.Location), "api-stub-generator", "apistubgen.py");
+            _telemetryClient = telemetryClient;
+
+            // Check if sandboxing is disabled for python
+            bool.TryParse(configuration["ReviewGenByPipelineDisabledForPython"], out bool _isDisabledForPython);
+            // Enable sandboxing when it's not disabled for python
+            IsReviewGenByPipeline = ! _isDisabledForPython;
         }
         public override string GetProcessorArguments(string originalName, string tempDirectory, string jsonPath)
         {
-            return $"{_apiScriptPath} --pkg-path {originalName} --temp-path {tempDirectory}" +
-                $" --out-path {jsonPath} --hide-report";
+            return $" -m apistub --pkg-path {originalName} --temp-path {tempDirectory}" +
+                $" --out-path {jsonPath}";
         }
 
         private string GetPythonVirtualEnv(string tempDirectory)
         {
             // Create virtual instance
-            RunProcess(tempDirectory, ProcessName, $" -m virtualenv {tempDirectory} --system-site-packages");
+            RunProcess(tempDirectory, ProcessName, $" -m virtualenv {tempDirectory} --system-site-packages --seeder app-data --symlink-app-data");
             return Path.Combine(tempDirectory, "Scripts", "python.exe");
         }
 
         public override async Task<CodeFile> GetCodeFileAsync(string originalName, Stream stream, bool runAnalysis)
         {
             var tempPath = Path.GetTempPath();
+            _telemetryClient.TrackEvent("Creating code file for " + originalName);
             var randomSegment = Guid.NewGuid().ToString("N");
             var tempDirectory = Path.Combine(tempPath, "ApiView", randomSegment);
             Directory.CreateDirectory(tempDirectory);
             var originalFilePath = Path.Combine(tempDirectory, originalName);
-
             var jsonFilePath = Path.ChangeExtension(originalFilePath, ".json");
 
             using (var file = File.Create(originalFilePath))
             {
                 await stream.CopyToAsync(file);
             }
-
             try
             {
-                var apiStubGenPath = GetPythonVirtualEnv(tempDirectory);
+                var pythonVenvPath = GetPythonVirtualEnv(tempDirectory);
                 var arguments = GetProcessorArguments(originalName, tempDirectory, jsonFilePath);
-                RunProcess(tempDirectory, apiStubGenPath, arguments);
+                RunProcess(tempDirectory, pythonVenvPath, arguments);
+                _telemetryClient.TrackEvent("Completed Python process run to parse " + originalName);
                 using (var codeFileStream = File.OpenRead(jsonFilePath))
                 {
-                    var codeFile = await CodeFile.DeserializeAsync(codeFileStream);
+                    var codeFile = await CodeFile.DeserializeAsync(codeFileStream, doTreeStyleParserDeserialization: LanguageServiceHelpers.UseTreeStyleParser(this.Name));
                     codeFile.VersionString = VersionString;
                     codeFile.Language = Name;
                     return codeFile;
                 }
+            }
+            catch(Exception ex)
+            {
+                _telemetryClient.TrackException(ex);
+                throw;
             }
             finally
             {
@@ -82,7 +93,8 @@ namespace APIViewWeb
             };
             using (var process = Process.Start(processStartInfo))
             {
-                process.WaitForExit();
+                process.WaitForExit(3 * 60 * 1000);
+                _telemetryClient.TrackEvent("Completed parsing python wheel. Exit code: " + process.ExitCode);
                 if (process.ExitCode != 0)
                 {
                     throw new InvalidOperationException(

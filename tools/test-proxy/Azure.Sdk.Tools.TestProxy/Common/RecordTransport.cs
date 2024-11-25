@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
 using Azure.Core;
@@ -18,13 +18,13 @@ namespace Azure.Sdk.Tools.TestProxy.Common
     {
         private readonly HttpPipelineTransport _innerTransport;
 
-        private readonly Func<RecordEntry, EntryRecordModel> _filter;
+        private readonly Func<RecordEntry, EntryRecordMode> _filter;
 
         private readonly Random _random;
 
         private readonly RecordSession _session;
 
-        public RecordTransport(RecordSession session, HttpPipelineTransport innerTransport, Func<RecordEntry, EntryRecordModel> filter, Random random)
+        public RecordTransport(RecordSession session, HttpPipelineTransport innerTransport, Func<RecordEntry, EntryRecordMode> filter, Random random)
         {
             _innerTransport = innerTransport;
             _filter = filter;
@@ -35,27 +35,27 @@ namespace Azure.Sdk.Tools.TestProxy.Common
         public override void Process(HttpMessage message)
         {
             _innerTransport.Process(message);
-            Record(message);
+            Record(message).Wait();
         }
 
         public override async ValueTask ProcessAsync(HttpMessage message)
         {
             await _innerTransport.ProcessAsync(message);
-            Record(message);
+            await Record(message);
         }
 
-        private void Record(HttpMessage message)
+        private async Task Record(HttpMessage message)
         {
             RecordEntry recordEntry = CreateEntry(message.Request, message.Response);
 
             switch (_filter(recordEntry))
             {
-                case EntryRecordModel.Record:
-                    _session.Record(recordEntry);
+                case EntryRecordMode.Record:
+                    await _session.Record(recordEntry);
                     break;
-                case EntryRecordModel.RecordWithoutRequestBody:
+                case EntryRecordMode.RecordWithoutRequestBody:
                     recordEntry.Request.Body = null;
-                    _session.Record(recordEntry);
+                    await _session.Record(recordEntry);
                     break;
                 default:
                     break;

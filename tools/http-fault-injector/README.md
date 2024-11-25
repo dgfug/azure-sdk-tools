@@ -7,11 +7,11 @@
 * No response. Then either wait indefinitely, close (TCP FIN), or abort (TCP RST).
 
 ## Installation
-1. [Install .Net](https://dotnet.microsoft.com/download)
+1. [Install .NET](https://dotnet.microsoft.com/download)
 
 2. Install http-fault-injector
 ```
-> dotnet tool install azure.sdk.tools.httpfaultinjector --global --add-source https://pkgs.dev.azure.com/azure-sdk/public/_packaging/azure-sdk-for-net/nuget/v3/index.json
+> dotnet tool install azure.sdk.tools.httpfaultinjector --global --prerelease --add-source https://pkgs.dev.azure.com/azure-sdk/public/_packaging/azure-sdk-for-net/nuget/v3/index.json
 
 You can invoke the tool using the following command: http-fault-injector
 Tool 'azure.sdk.tools.httpfaultinjector' (version '0.1.0') was successfully installed.
@@ -19,7 +19,7 @@ Tool 'azure.sdk.tools.httpfaultinjector' (version '0.1.0') was successfully inst
 
 ## Updating
 ```
-> dotnet tool update azure.sdk.tools.httpfaultinjector --global --add-source https://pkgs.dev.azure.com/azure-sdk/public/_packaging/azure-sdk-for-net/nuget/v3/index.json
+> dotnet tool update azure.sdk.tools.httpfaultinjector --global --prerelease --add-source https://pkgs.dev.azure.com/azure-sdk/public/_packaging/azure-sdk-for-net/nuget/v3/index.json
 
 Tool 'azure.sdk.tools.httpfaultinjector' was successfully updated from version '0.1.0' to version '0.1.1'.
 ```
@@ -41,10 +41,11 @@ Tool 'azure.sdk.tools.httpfaultinjector' was successfully updated from version '
 
 After these steps, .NET clients should automatically trust the certificate.  Other client languages may need additional steps.
 
-### Java Windows
+### Java
 1. Run `dotnet dev-certs https --export-path dotnet-dev-cert.pfx` to export the cert to a file
-2. Run `keytool -importcert -cacerts -file dotnet-dev-cert.pfx` to import the cert to the Java default cacerts keystore
-   1. Requires admin command prompt.
+2. Run `keytool -importcert -cacerts -file dotnet-dev-cert.pfx` (requires sudo/admin)
+   1. If prompted to `enter keystore password`, the default after installing Java is `changeit`
+   2. If `-cacerts` doesn't work, you can try replacing it with `-keystore /path/to/your/keystore`.  May be required depending how Java was installed, or especially if you have multiple versions installed side-by-side.
 
 ## Walkthrough
 1. Run `http-fault-injector`
@@ -60,7 +61,7 @@ Application started. Press Ctrl+C to shut down.
 ```
 > git clone https://github.com/Azure/azure-sdk-tools
 
-> cd azure-sdk-tools\tools\http-fault-injector\sample-clients\net\
+> cd azure-sdk-tools\tools\http-fault-injector\sample-clients\net\http-client\
 
 > dotnet run
 

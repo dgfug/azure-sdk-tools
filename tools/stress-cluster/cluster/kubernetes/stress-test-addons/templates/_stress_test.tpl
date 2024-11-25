@@ -1,26 +1,43 @@
 {{- define "stress-test-addons.job-wrapper.tpl" -}}
+{{- $global := index . 0 -}}
+{{- $definition := index . 1 -}}
 spec:
   template:
-    {{- include (index . 1) (index . 0) | nindent 4 -}}
+    {{- include $definition $global | nindent 4 -}}
 {{- end -}}
 
 {{- define "stress-test-addons.deploy-job-template.tpl" -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: "{{ lower .Scenario }}-{{ .Release.Name }}-{{ .Release.Revision }}"
+  name: "{{ lower .Stress.Scenario }}-{{ .Release.Name }}-{{ .Release.Revision }}"
   namespace: {{ .Release.Namespace }}
   labels:
     release: {{ .Release.Name }}
-    scenario: {{ .Scenario }}
+    scenario: {{ .Stress.Scenario }}
+    resourceGroupName: {{ .Stress.ResourceGroupName }}
+    baseName: {{ .Stress.BaseName }}
+    gitCommit: {{ .Values.GitCommit | default "" }}
 spec:
+  {{- if .Stress.parallel }}
+  completions: {{ .Stress.parallel }}
+  parallelism: {{ .Stress.parallel }}
+  completionMode: Indexed
+  {{- end }}
   backoffLimit: 0
   template:
     metadata:
       labels:
+        azure.workload.identity/use: "true"
         release: {{ .Release.Name }}
-        scenario: {{ .Scenario }}
+        scenario: {{ .Stress.Scenario }}
+        gitCommit: {{ .Values.GitCommit | default "" }}
+      {{- if .Values.PodDisruptionBudgetExpiry }}
+      annotations:
+        deletionLockExpiry: {{ .Values.PodDisruptionBudgetExpiry }}
+      {{- end }}
     spec:
+      serviceAccountName: {{ .Release.Namespace }}
       # In cases where a stress test has higher resource requirements or needs a dedicated node,
       # a new nodepool can be provisioned and labeled to allow custom scheduling.
       nodeSelector:
@@ -48,18 +65,13 @@ spec:
 {{- include "stress-test-addons.deploy-configmap" $global }}
 {{- range (default (list "stress") $global.Values.scenarios) }}
 ---
-{{- /* Copy scenario name into top level key of global context */}}
-{{ $instance := deepCopy $global | merge (dict "Scenario" . ) -}}
-{{- $jobOverride := fromYaml (include "stress-test-addons.job-wrapper.tpl" (list $instance $podDefinition)) -}}
-{{- /*
-    The .Values context here corresponds to the parent chart that includes this library as a dependency,
-    meaning there will be a .Values.stress-test-addons key that contains the values specific to this library.
-    Given that we are calling into library templates, replace the values context with only the nested
-    context for this sub-chart.
-*/ -}}
-{{ $_ := set $instance "Values" (index $instance "Values" "stress-test-addons") -}}
-{{- $tpl := fromYaml (include "stress-test-addons.deploy-job-template.tpl" $instance) -}}
+{{ $jobCtx := fromYaml (include "stress-test-addons.util.mergeStressContext" (list $global . )) }}
+{{- $jobOverride := fromYaml (include "stress-test-addons.job-wrapper.tpl" (list $jobCtx $podDefinition)) -}}
+{{- $tpl := fromYaml (include "stress-test-addons.deploy-job-template.tpl" $jobCtx) -}}
 {{- toYaml (merge $jobOverride $tpl) -}}
+{{- end }}
+{{- if $global.Values.PodDisruptionBudgetExpiry }}
+{{- include "stress-test-addons.pod-disruption-budget" $global }}
 {{- end }}
 {{- end -}}
 
@@ -67,19 +79,34 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: "{{ .Scenario }}-{{ .Release.Name }}-{{ .Release.Revision }}"
+  name: "{{ .Stress.Scenario }}-{{ .Release.Name }}-{{ .Release.Revision }}"
   namespace: {{ .Release.Namespace }}
   labels:
     release: {{ .Release.Name }}
-    scenario: {{ .Scenario }}
+    scenario: {{ .Stress.Scenario }}
+    resourceGroupName: {{ .Stress.ResourceGroupName }}
+    baseName: {{ .Stress.BaseName }}
+    gitCommit: {{ .Values.GitCommit | default "" }}
 spec:
+  {{- if .Stress.parallel }}
+  completions: {{ .Stress.parallel }}
+  parallelism: {{ .Stress.parallel }}
+  completionMode: Indexed
+  {{- end }}
   backoffLimit: 0
   template:
     metadata:
       labels:
+        azure.workload.identity/use: "true"
         release: {{ .Release.Name }}
-        scenario: {{ .Scenario }}
+        scenario: {{ .Stress.Scenario }}
+        gitCommit: {{ .Values.GitCommit | default "" }}
+      {{- if .Values.PodDisruptionBudgetExpiry }}
+      annotations:
+        deletionLockExpiry: {{ .Values.PodDisruptionBudgetExpiry }}
+      {{- end }}
     spec:
+      serviceAccountName: {{ .Release.Namespace }}
       nodeSelector:
         sku: 'default'
       restartPolicy: Never
@@ -100,16 +127,12 @@ spec:
 {{- range (default (list "stress") $global.Values.scenarios) }}
 ---
 {{- /* Copy scenario name into top level key of global context */}}
-{{ $instance := deepCopy $global | merge (dict "Scenario" . ) -}}
-{{- $jobOverride := fromYaml (include "stress-test-addons.job-wrapper.tpl" (list $instance $podDefinition)) -}}
-{{- /*
-    The .Values context here corresponds to the parent chart that includes this library as a dependency,
-    meaning there will be a .Values.stress-test-addons key that contains the values specific to this library.
-    Given that we are calling into library templates, replace the values context with only the nested
-    context for this sub-chart.
-*/ -}}
-{{ $_ := set $instance "Values" (index $instance "Values" "stress-test-addons") -}}
-{{- $tpl := fromYaml (include "stress-test-addons.env-job-template.tpl" $instance) -}}
+{{ $jobCtx := fromYaml (include "stress-test-addons.util.mergeStressContext" (list $global . )) }}
+{{- $jobOverride := fromYaml (include "stress-test-addons.job-wrapper.tpl" (list $jobCtx $podDefinition)) -}}
+{{- $tpl := fromYaml (include "stress-test-addons.env-job-template.tpl" $jobCtx) -}}
 {{- toYaml (merge $jobOverride $tpl) -}}
+{{- end }}
+{{- if $global.Values.PodDisruptionBudgetExpiry }}
+{{- include "stress-test-addons.pod-disruption-budget" $global }}
 {{- end }}
 {{- end -}}

@@ -1,5 +1,6 @@
-﻿using System.Threading.Tasks;
-using APIViewWeb.Respositories;
+using System.Threading.Tasks;
+using APIViewWeb.Managers;
+using APIViewWeb.Repositories;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 
@@ -7,11 +8,13 @@ namespace APIViewWeb.Pages.Assemblies
 {
     public class DeleteModel : PageModel
     {
-        private readonly ReviewManager _manager;
+        private readonly IReviewManager _manager;
+        public readonly UserPreferenceCache _preferenceCache;
 
-        public DeleteModel(ReviewManager manager)
+        public DeleteModel(IReviewManager manager, UserPreferenceCache preferenceCache)
         {
             _manager = manager;
+            _preferenceCache = preferenceCache;
         }
 
         public string AssemblyName { get; set; }
@@ -24,7 +27,7 @@ namespace APIViewWeb.Pages.Assemblies
             }
 
             var reviewModel = await _manager.GetReviewAsync(User, id);
-            AssemblyName = reviewModel.DisplayName;
+            AssemblyName = reviewModel.PackageName;
 
             return Page();
         }
@@ -36,7 +39,7 @@ namespace APIViewWeb.Pages.Assemblies
                 return NotFound();
             }
 
-            await _manager.DeleteReviewAsync(User, id);
+            await _manager.SoftDeleteReviewAsync(User, id);
 
             return RedirectToPage("./Index");
         }

@@ -1,0 +1,106 @@
+
+resources:
+  repositories:
+    - repository: azure-sdk-build-tools
+      type: git
+      name: internal/azure-sdk-build-tools
+      ref: refs/tags/azure-sdk-build-tools_20241025.1
+
+parameters:
+  - name: BuildToolsRepoPath
+    type: string
+    default: '$(Build.SourcesDirectory)/azure-sdk-build-tools'
+  - name: ArtifactsPath
+    type: string
+    default: '$(System.DefaultWorkingDirectory)/artifacts'
+  - name: PartnerDropsBlobBase
+    type: string
+    default: 'https://azuresdkpartnerdrops.blob.core.windows.net/drops'
+  - name: PartnerDropsBlobSourceSuffix
+    type: string
+    default: ''
+  - name: NugetVersion
+    type: string
+    default: '5.4.x'
+  - name: DevOpsFeedID
+    type: string
+    default: ''
+  - name: ShouldSign
+    type: boolean
+    default: true
+  - name: ShouldPublish
+    type: boolean
+    default: true
+
+variables:
+  - template: /eng/pipelines/templates/variables/globals.yml
+
+jobs:
+  - job: AzurePartnerDropsToNuget
+    pool:
+      name: azsdk-pool-mms-win-2022-general
+      vmImage: windows-2022
+
+    steps:
+      - checkout: self
+      - checkout: azure-sdk-build-tools
+
+      - task: AzurePowerShell@5
+        displayName: 'Copy from azuresdkpartnerdrops'
+        condition: and(succeeded(), ne(variables['SkipCopyFromPartnerDrops'], 'true'))
+        inputs:
+          azureSubscription: 'azuresdkpartnerdrops - Storage Partner Drops'
+          ScriptType: 'InlineScript'
+          azurePowerShellVersion: LatestVersion 
+          pwsh: true
+          Inline: |
+            echo "azcopy copy '${{ parameters.PartnerDropsBlobBase }}/${{ parameters.PartnerDropsBlobSourceSuffix }}/*' '${{ parameters.ArtifactsPath }}' --recursive=true"
+            azcopy copy '${{ parameters.PartnerDropsBlobBase }}/${{ parameters.PartnerDropsBlobSourceSuffix }}/*' '${{ parameters.ArtifactsPath }}' --recursive=true
+            $copiedFiles = (dir '${{ parameters.ArtifactsPath }}' -r | % { $_.FullName })
+            echo "Copied files: $copiedFiles"
+            if (!$copiedFiles) { 
+              echo "Failed to copy any files from '${{ parameters.PartnerDropsBlobBase }}/${{ parameters.PartnerDropsBlobSourceSuffix }}/*' please double check they exist"
+              exit 1
+            }            
+        env: 
+          AZCOPY_AUTO_LOGIN_TYPE: 'PSCRED'     
+
+      - ${{ if eq(parameters.ShouldSign, true) }}:
+        - template: pipelines/steps/net-signing.yml@azure-sdk-build-tools
+          parameters:
+            PackagesPath: ${{ parameters.ArtifactsPath }}
+            BuildToolsPath: ${{ parameters.BuildToolsRepoPath }}
+
+      - ${{ if eq(parameters.ShouldPublish, true) }}:
+        - template: pipelines/steps/publish-symbols.yml@azure-sdk-build-tools
+          parameters:
+            BuildToolsRepositoryPath: ${{ parameters.BuildToolsRepoPath }}
+            PackagesPath: ${{ parameters.ArtifactsPath }}
+            StagingDirectory: $(Build.ArtifactStagingDirectory)/symbols
+
+        - task: NuGetToolInstaller@1
+          displayName: 'Use NuGet ${{ parameters.NugetVersion }}'
+          inputs:
+            versionSpec: ${{ parameters.NugetVersion }}
+
+        - ${{ if ne(parameters.DevOpsFeedID, '') }}:
+          - task: NuGetCommand@2
+            displayName: 'Publish to DevOps Feed'
+            inputs:
+              command: push
+              packagesToPush: '${{ parameters.ArtifactsPath }}/**/*.nupkg;!${{ parameters.ArtifactsPath }}/**/*.symbols.nupkg'
+              publishVstsFeed: ${{ parameters.DevOpsFeedID }}
+
+        - ${{ if eq(parameters.DevOpsFeedID, '') }}:
+          - task: NuGetCommand@2
+            displayName: 'Publish to Nuget'
+            inputs:
+              command: push
+              packagesToPush: '${{ parameters.ArtifactsPath }}/**/*.nupkg;!${{ parameters.ArtifactsPath }}/**/*.symbols.nupkg'
+              nuGetFeedType: external
+              publishFeedCredentials: Nuget.org
+
+      - publish: '${{ parameters.ArtifactsPath }}'
+        displayName: Upload Packages to Artifacts
+        artifact: packages
+        condition: succeeded()

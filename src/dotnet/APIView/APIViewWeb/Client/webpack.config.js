@@ -1,21 +1,16 @@
 const path = require('path');
-
-const VueLoaderPlugin = require('vue-loader/lib/plugin');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const { DuplicatesPlugin } = require("inspectpack/plugin");
 
 module.exports = {
   mode: "production",
   entry: [
     './src/main.ts',
-    './css/site.scss'
+    './css/main.scss'
   ],
   devtool: 'source-map',
   module: {
     rules: [
-      {
-        test: /\.vue$/,
-        loader: 'vue-loader'
-      },
       {
         test: /\.s[ac]ss$/i,
         use: [
@@ -25,6 +20,11 @@ module.exports = {
           {
             loader: 'css-loader',
             options: {
+              url: {
+                filter: (url, resourcePath) => {
+                  return !url.startsWith('/icons/');
+                },
+              },
               sourceMap: true,
             },
           },
@@ -41,19 +41,29 @@ module.exports = {
         use: 'ts-loader',
         exclude: /node_modules/,
       },
+      {
+        test: /\.(png|jpe?g|gif|svg)$/i,
+        type: 'asset/source',
+      },
     ]
   },
   plugins: [
-    new VueLoaderPlugin(),
     new MiniCssExtractPlugin({
-      filename: 'site.css'
+      filename: 'main.css'
     }),
+    new DuplicatesPlugin({
+      emitErrors: false,
+      verbose: false
+    })
   ],
   resolve: {
+    alias: {
+      '@wwwroot': path.resolve(__dirname, '../wwwroot'),
+    },
     extensions: [ '.tsx', '.ts', '.js' ],
   },
   output: {
-    filename: 'site.js',
+    filename: 'main.js',
     path: path.resolve(__dirname, '../wwwroot'),
   },
 }

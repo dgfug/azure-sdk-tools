@@ -1,36 +1,26 @@
 import * as Constants from 'oav/dist/lib/util/constants'
-import * as lodash from 'lodash'
 import * as oav from 'oav'
 import * as path from 'path'
+import { AzureExtensions, LRO_CALLBACK } from '../common/constants'
 import { Config } from '../common/config'
 import {
-    HasChildResource,
     HttpStatusCode,
     IntentionalError,
     LroCallbackNotFound,
-    NoParentResource,
-    NoResponse,
-    ResourceNotFound,
     ValidationFail
 } from '../common/errors'
 import { InjectableTypes } from '../lib/injectableTypes'
-import { LRO_CALLBACK } from '../common/constants'
+import { LiveValidationError } from 'oav/dist/lib/models'
+import { Operation } from 'oav/dist/lib//swagger/swaggerTypes'
 import { OperationMatch, OperationSearcher } from 'oav/dist/lib/liveValidation/operationSearcher'
-import { ResourcePool } from './resource'
 import { ResponseGenerator } from './responser'
 import { SpecRetriever } from '../lib/specRetriever'
 import { ValidationRequest } from 'oav/dist/lib/liveValidation/operationValidator'
 import { VirtualServerRequest, VirtualServerResponse } from './models'
-import {
-    getPath,
-    getPureUrl,
-    isManagementUrlLevel,
-    logger,
-    queryToObject,
-    replacePropertyValue
-} from '../common/utils'
+import { getPath, getPureUrl, logger, replacePropertyValue } from '../common/utils'
 import { get_locations, get_tenants } from './specials'
 import { inject, injectable } from 'inversify'
+import _ from 'lodash'
 
 export enum ValidatorStatus {
     NotInitialized = 'Validator not initialized',
@@ -40,36 +30,15 @@ export enum ValidatorStatus {
 
 @injectable()
 export class Coordinator {
-    private liveValidator: oav.LiveValidator
+    public liveValidator: oav.LiveValidator
     private statusValue = ValidatorStatus.NotInitialized
-    private resourcePool: ResourcePool
 
     constructor(
         @inject(InjectableTypes.Config) private config: Config,
         @inject(InjectableTypes.SpecRetriever) private specRetriever: SpecRetriever,
         @inject(InjectableTypes.ResponseGenerator)
         private responseGenerator: ResponseGenerator
-    ) {
-        this.initiateResourcePool()
-    }
-
-    public initiateResourcePool() {
-        this.resourcePool = new ResourcePool(this.config.cascadeEnabled)
-    }
-
-    private findResponse(responses: Record<string, any>, status: number): [number, any] {
-        let nearest = undefined
-        for (const code in responses) {
-            if (
-                nearest === undefined ||
-                Math.abs(nearest - status) > Math.abs(parseInt(code) - status)
-            ) {
-                nearest = parseInt(code)
-            }
-        }
-        if (nearest) return [nearest, responses[nearest.toString()].body]
-        throw new NoResponse(status.toString())
-    }
+    ) {}
 
     private search(
         searcher: OperationSearcher,
@@ -127,9 +96,11 @@ export class Coordinator {
                 shouldClone: false
             },
             swaggerPathsPattern: this.config.validationPathsPattern,
+            excludedSwaggerPathsPattern: this.config.excludedValidationPathsPattern,
             directory: path.resolve(this.config.specRetrievalLocalRelativePath),
             isPathCaseSensitive: false
         }
+        logger.info(`validator is initializing with options ${JSON.stringify(options, null, 4)}`)
         this.liveValidator = new oav.LiveValidator(options)
         await this.liveValidator.initialize()
         this.statusValue = ValidatorStatus.Initialized
@@ -140,7 +111,7 @@ export class Coordinator {
         req: VirtualServerRequest,
         res: VirtualServerResponse,
         profile: Record<string, any>
-    ): Promise<void> {
+    ) {
         const fullUrl = req.protocol + '://' + req.headers?.host + req.url
         const liveRequest = {
             url: fullUrl,
@@ -163,21 +134,57 @@ export class Coordinator {
                 Constants.ErrorCodes.MultipleOperationsFound.name
         ) {
             const result = this.search(this.liveValidator.operationSearcher, validationRequest)
-            const example = await this.responseGenerator.generate(
+            let lroCallback: string | null = null
+            if (result.operationMatch.operation[AzureExtensions.XMsLongRunningOperation]) {
+                try {
+                    lroCallback = await this.findLROGet(req, result.operationMatch.operation)
+                } catch (err) {
+                    if (err instanceof LroCallbackNotFound) {
+                        // degrade to non-lro if 1) no callback operation can be found and 2) there is 200 responses
+                        const [_, specItem] = await this.responseGenerator.loadSpecAndItem(
+                            result.operationMatch.operation,
+                            this.config
+                        )
+                        if (
+                            !(HttpStatusCode.OK.toString() in (specItem?.content.responses || {}))
+                        ) {
+                            throw err
+                        }
+                    } else {
+                        throw err
+                    }
+                }
+            }
+            const [statusCode, response] = await this.responseGenerator.generate(
+                res,
+                this.liveValidator,
                 result.operationMatch.operation,
                 this.config,
-                liveRequest
+                liveRequest,
+                lroCallback
             )
             if (profile?.alwaysError) {
                 throw new IntentionalError()
             }
-            await this.genStatefulResponse(req, res, example.responses, profile)
+            await this.responseGenerator.genStatefulResponse(
+                req,
+                res,
+                profile,
+                statusCode,
+                response
+            )
         } else {
-            const exampleResponse = this.handleSpecials(req, validationRequest)
-            if (exampleResponse === undefined) {
+            const [statusCode, response] = this.handleSpecials(req, validationRequest)
+            if (statusCode === undefined) {
                 throw new ValidationFail(JSON.stringify(validateResult))
             } else {
-                await this.genStatefulResponse(req, res, exampleResponse, profile)
+                await this.responseGenerator.genStatefulResponse(
+                    req,
+                    res,
+                    profile,
+                    statusCode.toString(),
+                    response
+                )
             }
         }
     }
@@ -185,13 +192,14 @@ export class Coordinator {
     public handleSpecials(
         req: VirtualServerRequest,
         validationRequest: ValidationRequest
-    ): Record<string, any> | undefined {
+    ): [HttpStatusCode | undefined, any] {
         if (validationRequest.providerNamespace === 'microsoft.unknown') {
             const path = getPath(getPureUrl(req.url))
-            if (path.length === 2) {
+            if (path.length === 2 && path[0].toLowerCase() === 'subscriptions') {
                 // handle "/subscriptions/{subscriptionId}"
-                return {
-                    [HttpStatusCode.OK]: {
+                return [
+                    HttpStatusCode.OK,
+                    {
                         body: {
                             id: `/subscriptions/${path[1]}`,
                             authorizationSource: 'RoleBased',
@@ -207,12 +215,13 @@ export class Coordinator {
                             }
                         }
                     }
-                }
+                ]
             }
             if (path.length === 4 && path[2].toLowerCase() === 'resourcegroups') {
                 // handle "/subscriptions/xxx/resourceGroups/xxx"
-                return {
-                    [HttpStatusCode.OK]: {
+                return [
+                    HttpStatusCode.OK,
+                    {
                         body: {
                             id: getPureUrl(req.url),
                             location: 'eastus',
@@ -225,100 +234,66 @@ export class Coordinator {
                             type: 'Microsoft.Resources/resourceGroups'
                         }
                     }
-                }
+                ]
             }
             if (path.length === 3 && path[2].toLowerCase() === 'locations') {
-                return {
-                    [HttpStatusCode.OK]: {
+                return [
+                    HttpStatusCode.OK,
+                    {
                         body: replacePropertyValue(
                             '0000000-0000-0000-0000-000000000000',
                             path[1],
                             get_locations
                         )
                     }
-                }
+                ]
             }
             if (path.length === 1 && path[0].toLowerCase() === 'tenants') {
-                return { [HttpStatusCode.OK]: { body: get_tenants } }
+                return [HttpStatusCode.OK, { body: get_tenants }]
             }
         }
-        return undefined
+        return [undefined, undefined]
     }
 
-    public async genStatefulResponse(
-        req: VirtualServerRequest,
-        res: VirtualServerResponse,
-        exampleResponses: Record<string, any>,
-        profile: Record<string, any>
-    ) {
-        if (profile?.stateful) {
-            const url: string = getPureUrl(req.url) as string
-            const pathNames = getPath(url)
-            // in stateful behaviour, GET and DELETE can only be called if resource/path exist
-            if (
-                ['GET', 'DELETE', 'PATCH'].indexOf(req.method.toUpperCase()) >= 0 &&
-                isManagementUrlLevel(pathNames.length, url) &&
-                !this.resourcePool.hasUrl(req)
-            ) {
-                throw new ResourceNotFound(url)
-            }
-        }
-
-        const manipulateSucceed = this.resourcePool.updateResourcePool(req)
-        if (profile?.stateful && !manipulateSucceed) {
-            if (ResourcePool.isCreateMethod(req)) {
-                throw new NoParentResource(req.url)
-            } else {
-                throw new HasChildResource(req.url)
-            }
-        } else {
-            const [code, _ret] = this.findResponse(exampleResponses, HttpStatusCode.OK)
-
-            let ret = _ret
-            // simplified paging
-            ret = lodash.omit(ret, 'nextLink')
-
-            // simplified LRO
-            ret = replacePropertyValue('provisioningState', 'Succeeded', ret)
-
-            if (code !== HttpStatusCode.OK && code !== HttpStatusCode.NO_CONTENT && code < 300) {
-                res.setHeader('Azure-AsyncOperation', await this.findLROGet(req))
-                res.setHeader('Retry-After', 1)
-            }
-            if (req.query?.[LRO_CALLBACK] === 'true') {
-                ret.status = 'Succeeded'
-            }
-
-            //set name
-            const path = getPath(getPureUrl(req.url))
-            ret = replacePropertyValue('name', path[path.length - 1], ret, (v) => {
-                return typeof v === 'string'
-            })
-
-            res.set(code, ret)
-        }
-    }
-
-    async findLROGet(req: VirtualServerRequest): Promise<string> {
+    async findLROGet(req: VirtualServerRequest, operation: Operation): Promise<string> {
         const [uri, query] = `${req.url}&${LRO_CALLBACK}=true`.split('?')
         const uriPath = uri.split('/')
-        const objQuery = queryToObject(query)
+        const oriLen = uriPath.length
         let firstloop = true
         while (uriPath.length > 0) {
+            // if trackback for two part without found, then throw `no cooresponding get method` error
+            if (oriLen - uriPath.length > 4) {
+                break
+            }
             if (firstloop || uriPath.length % 2 === 1) {
-                const testingUrl = `${req.protocol}://${req.headers?.host}${uriPath.join(
-                    '/'
-                )}?${query}`
-                const liveRequest = {
-                    url: testingUrl,
-                    method: 'GET',
-                    headers: req.headers as any,
-                    query: objQuery,
-                    body: {}
+                let hostAndPort = req.headers?.host as string
+                if (hostAndPort.indexOf(':') < 0) {
+                    hostAndPort = `${hostAndPort}:${req.localPort}`
                 }
-                const validateResult = await this.validate(liveRequest)
-                if (validateResult.isSuccessful) {
-                    return testingUrl
+                const testingUrl = `${req.protocol}://${hostAndPort}${uriPath.join('/')}?${query}`
+                try {
+                    const validationRequest = this.liveValidator.parseValidationRequest(
+                        testingUrl,
+                        'GET',
+                        req.headers?.[AzureExtensions.XMsCorrelationRequestId] || ''
+                    )
+                    const result = this.liveValidator.operationSearcher.search(validationRequest)
+                    const finalState = HttpStatusCode.OK.toString()
+                    if (
+                        JSON.stringify(operation.responses?.[finalState]?.['schema']) ===
+                        JSON.stringify(
+                            result.operationMatch.operation?.responses?.[finalState]?.['schema']
+                        )
+                    )
+                        return testingUrl
+                } catch (error) {
+                    if (
+                        error instanceof LiveValidationError &&
+                        error?.code === Constants.ErrorCodes.MultipleOperationsFound.name
+                    ) {
+                        return testingUrl
+                    }
+                    console.info(error) // don't has 'GET' verb for this url
                 }
             }
             uriPath.splice(-1)
@@ -327,7 +302,7 @@ export class Coordinator {
         throw new LroCallbackNotFound(`Lro operation: ${req.method} ${req.url}`)
     }
 
-    async validate(liveRequest: oav.LiveRequest) {
+    private async validate(liveRequest: oav.LiveRequest) {
         return this.liveValidator.validateLiveRequest(liveRequest)
     }
 }

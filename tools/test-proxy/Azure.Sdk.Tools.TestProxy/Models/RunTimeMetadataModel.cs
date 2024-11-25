@@ -1,11 +1,10 @@
-﻿using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.AspNetCore.Mvc.RazorPages;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Xml;
 using System.IO;
-using Azure.Sdk.Tools.TestProxy.Common;
 
 namespace Azure.Sdk.Tools.TestProxy.Models
 {
@@ -75,12 +74,40 @@ namespace Azure.Sdk.Tools.TestProxy.Models
             IList<FieldInfo> fields = new List<FieldInfo>(tType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance));
             var arguments = new List<Tuple<string, string>>();
 
-            foreach (FieldInfo field in fields.Where(x => x.FieldType.Name == "String"))
-            {
-                var prop = field.GetValue(target);
-                string propValue = prop == null ? "This argument is unset or null." : "\"" + prop.ToString() + "\"";
+            var filteredFields = fields.Where(x => x.FieldType.Name == "String" || x.FieldType.Name == "ApplyCondition");
 
-                arguments.Add(new Tuple<string, string>(field.Name, propValue));
+            // we only want to crawl the fields if it is an inherited type. customizations are not offered
+            // when looking at a base RecordMatcher, ResponseTransform, or RecordedTestSanitizer
+            // These 3 will have a basetype of Object
+            if (tType.BaseType != typeof(Object))
+            {
+                foreach (FieldInfo field in filteredFields)
+                {
+                    var prop = field.GetValue(target);
+                    string propValue;
+                    if (prop == null)
+                    {
+                        propValue = "This argument is unset or null.";
+                    }
+                    else
+                    {
+                        if (field.FieldType.Name == "ApplyCondition")
+                        {
+                            propValue = prop.ToString();
+
+                            if (propValue == null)
+                            {
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            propValue = "\"" + prop.ToString() + "\"";
+                        }
+                    }
+
+                    arguments.Add(new Tuple<string, string>(GetFriendlyFieldName(field.Name), propValue));
+                }
             }
 
             return new CtorDescription()
@@ -88,6 +115,31 @@ namespace Azure.Sdk.Tools.TestProxy.Models
                 Description = String.Empty,
                 Arguments = arguments
             };
+        }
+
+        public static Dictionary<string, string> FieldNameMapping = new Dictionary<string, string>()
+        {
+            { "_jsonPath", "jsonPath" },
+            { "_value", "value" },
+            { "_regex", "regex" },
+            { "_groupForReplace", "groupForReplace" },
+            { "_condition", "condition" },
+            { "_target", "target" },
+            { "_key", "key" },
+            { "_method", "method" },
+            { "_newValue", "value" },
+            { "_resetAfterFirst", "resetAfterFirst" },
+            { "_regexValue", "regex" }
+        };
+
+        public string GetFriendlyFieldName(string fieldName)
+        {
+            if (!string.IsNullOrWhiteSpace(fieldName) && FieldNameMapping.ContainsKey(fieldName))
+            {
+                return FieldNameMapping[fieldName];
+            }
+
+            return fieldName;
         }
 
         public string GetClassDocComment(Type type, XmlDocument docCommentXml)
@@ -108,8 +160,10 @@ namespace Azure.Sdk.Tools.TestProxy.Models
         // for this to work you need to have generatexmldoc activated and the generated comment xml MUST be alongside the assembly
         public XmlDocument GetDocCommentXML()
         {
-            var location = Assembly.Location;
-            using (var xmlReader = new StreamReader(Path.ChangeExtension(location, ".xml")))
+            var location = System.AppContext.BaseDirectory;
+
+            var name = Assembly.GetName().Name;
+            using (var xmlReader = new StreamReader(Path.Join(location, $"{name}.xml")))
             {
                 XmlDocument result = new XmlDocument();
                 result.Load(xmlReader);

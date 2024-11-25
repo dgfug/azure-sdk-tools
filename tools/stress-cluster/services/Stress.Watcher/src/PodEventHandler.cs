@@ -8,6 +8,7 @@ using k8s.Models;
 using Serilog;
 using Serilog.Context;
 using Serilog.Sinks.SystemConsole.Themes;
+using Azure.ResourceManager;
 
 namespace Stress.Watcher
 {
@@ -37,6 +38,8 @@ namespace Stress.Watcher
         private Kubernetes Client;
         private GenericChaosClient ChaosClient;
 
+        private ArmClient ARMClient;
+
         private Serilog.Core.Logger Logger;
 
         public string Namespace;
@@ -44,11 +47,13 @@ namespace Stress.Watcher
         public PodEventHandler(
             Kubernetes client,
             GenericChaosClient chaosClient,
+            ArmClient armClient,
             string watchNamespace = ""
         )
         {
             Client = client;
             ChaosClient = chaosClient;
+            ARMClient = armClient;
             Namespace = watchNamespace;
 
             Logger = new LoggerConfiguration()
@@ -72,7 +77,9 @@ namespace Stress.Watcher
             {
                 try
                 {
-                    var listTask = Client.ListPodForAllNamespacesWithHttpMessagesAsync(
+                    Logger.Information("Starting pod watch");
+
+                    var listTask = Client.CoreV1.ListPodForAllNamespacesWithHttpMessagesAsync(
                         allowWatchBookmarks: true,
                         watch: true,
                         resourceVersion: resourceVersion,
@@ -151,10 +158,17 @@ namespace Stress.Watcher
                         .Where(cr => ShouldStartChaos(cr, pod))
                         .Select(async cr =>
                         {
-                            await Client.PatchNamespacedCustomObjectWithHttpMessagesAsync(
-                                    PodChaosResumePatchBody, ChaosClient.Group, ChaosClient.Version,
-                                    pod.Namespace(), cr.Kind.ToLower(), cr.Metadata.Name);
+                            string plural = "";
+                            foreach (string pluralName in Enum.GetNames(typeof(GenericChaosClient.ChaosResourcePlurals))) {
+                                if (pluralName.Contains(cr.Kind.ToLower())) {
+                                    plural = pluralName;
+                                    break;
+                                }
+                            }
 
+                            await Client.PatchNamespacedCustomObjectAsync(
+                                    PodChaosResumePatchBody, ChaosClient.Group, ChaosClient.Version,
+                                    pod.Namespace(), plural, cr.Metadata.Name);
                             using (LogContext.PushProperty("chaosResource", $"{cr.Kind}/{cr.Metadata.Name}"))
                             {
                                 Logger.Information($"Started chaos for pod.");
@@ -166,11 +180,10 @@ namespace Stress.Watcher
 
         public bool ShouldStartChaos(GenericChaosResource chaos, V1Pod pod)
         {
-            if (chaos.Spec.Selector.LabelSelectors?.TestInstance != pod.TestInstance())
+            if (chaos.Spec.GetTestInstance() != pod.TestInstance())
             {
                 return false;
             }
-
             return chaos.IsPaused();
         }
 
@@ -194,7 +207,7 @@ namespace Stress.Watcher
                 return false;
             }
 
-            if (!pod.Metadata.Labels.TryGetValue("chaos", out var chaos) || chaos != "true")
+            if (pod.Metadata.Labels?.TryGetValue("chaos", out var chaos) != true || chaos != "true")
             {
                 return false;
             }

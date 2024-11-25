@@ -1,4 +1,4 @@
-﻿using Azure.Sdk.Tools.TestProxy.Common;
+using Azure.Sdk.Tools.TestProxy.Common;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
@@ -6,7 +6,7 @@ using System;
 namespace Azure.Sdk.Tools.TestProxy.Sanitizers
 {
     /// <summary>
-    /// This sanitizer operates on a RecordSession entry and applies itself to the Request and Response bodies contained therein. It ONLY operates on the request/response bodies. Not header or URIs.
+    /// This sanitizer operates on a RecordSession entry and applies regex replacement to the Request and Response bodies contained therein. It ONLY operates on the request/response bodies. Not header or URIs.
     /// </summary>
     public class BodyKeySanitizer : RecordedTestSanitizer
     {
@@ -25,55 +25,81 @@ namespace Azure.Sdk.Tools.TestProxy.Sanitizers
         /// <param name="value">The substitution value.</param>
         /// <param name="regex">A regex. Can be defined as a simple regex replace OR if groupForReplace is set, a subsitution operation. Defaults to replacing the entire string.</param>
         /// <param name="groupForReplace">The regex capture group that needs to be operated upon. Do not set if you're invoking a simple replacement operation.</param>
-        public BodyKeySanitizer(string jsonPath, string value = "Sanitized", string regex = ".*", string groupForReplace = null)
+        /// <param name="condition">
+        /// A condition that dictates when this sanitizer applies to a request/response pair. The content of this key should be a JSON object that contains various configuration keys. 
+        /// Currently, that only includes the key "uriRegex". This translates to an object that looks like '{ "uriRegex": "when this regex matches, apply the sanitizer" }'. Defaults to "apply always."
+        /// </param>
+        public BodyKeySanitizer(string jsonPath, string value = "Sanitized", string regex = ".+", string groupForReplace = null, ApplyCondition condition = null)
         {
             _jsonPath = jsonPath;
             _newValue = value;
             _regexValue = regex;
             _groupForReplace = groupForReplace;
+            Condition = condition;
+
+            StringSanitizer.ConfirmValidRegex(regex);
         }
 
         public override string SanitizeTextBody(string contentType, string body)
         {
             bool sanitized = false;
-            JToken jsonO;
+            JToken jsonO = null;
 
-            try
+            if (contentType.ToLower().Contains("json"))
             {
-                // Prevent default behavior where JSON.NET will convert DateTimeOffset
-                // into a DateTime.
-                if (!LegacyConvertJsonDateTokens)
+                try
                 {
-                    jsonO = JsonConvert.DeserializeObject<JToken>(body, SerializerSettings);
-                }
-                else
-                {
-                    jsonO = JToken.Parse(body);
-                }
-            }
-            catch(JsonReaderException)
-            {
-                return body;
-            }
-
-            
-            foreach (JToken token in jsonO.SelectTokens(_jsonPath))
-            {
-                // HasValues is false for tokens with children. We will not apply sanitization if that is the case.
-                if (!token.HasValues)
-                {
-                    var originalValue = token.Value<string>();
-
-                    var replacement = StringSanitizer.SanitizeValue(originalValue, _newValue, _regexValue, _groupForReplace);
-
-                    // this sanitizer should only apply to actual values
-                    // if we attempt to apply a regex update to a jtoken that has a more complex type, throw
-                    token.Replace(JToken.FromObject(replacement));
-
-                    if(originalValue != replacement)
+                    // Prevent default behavior where JSON.NET will convert DateTimeOffset
+                    // into a DateTime.
+                    if (!LegacyConvertJsonDateTokens)
                     {
-                        sanitized = true;
+                        jsonO = JsonConvert.DeserializeObject<JToken>(body, SerializerSettings);
                     }
+                    else
+                    {
+                        jsonO = JToken.Parse(body);
+                    }
+                }
+                catch (JsonReaderException)
+                {
+                    return body;
+                }
+            }
+
+            if (jsonO != null)
+            {
+                try
+                {
+                    foreach (JToken token in jsonO.SelectTokens(_jsonPath))
+                    {
+                        // HasValues is false for tokens with children. We will not apply sanitization if that is the case.
+                        if (!token.HasValues)
+                        {
+                            var originalValue = token.Value<string>();
+
+                            // regex replacement does not support null
+                            if (originalValue == null)
+                            {
+                                continue;
+                            }
+
+                            var replacement = StringSanitizer.SanitizeValue(originalValue, _newValue, _regexValue, _groupForReplace);
+
+                            // this sanitizer should only apply to actual values
+                            // if we attempt to apply a regex update to a jtoken that has a more complex type, throw
+                            token.Replace(JToken.FromObject(replacement));
+
+                            if (originalValue != replacement)
+                            {
+                                sanitized = true;
+                            }
+                        }
+                    }
+                } 
+                catch(Exception e)
+                {
+                    DebugLogger.LogError($"Ran into exception \"{e.Message}\" while attempting to run regex \"{_regexValue}\" against body value \"{body}\"");
+                    return body;
                 }
             }
 

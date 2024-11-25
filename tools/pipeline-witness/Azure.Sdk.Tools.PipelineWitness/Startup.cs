@@ -1,116 +1,95 @@
-﻿using Azure.Cosmos;
-using Azure.Sdk.Tools.PipelineWitness;
-using Azure.Sdk.Tools.PipelineWitness.Services.FailureAnalysis;
-using Azure.Security.KeyVault.Secrets;
-using Microsoft.Azure.Functions.Extensions.DependencyInjection;
+using System;
+using System.Threading;
+using Azure.Core;
+using Azure.Core.Extensions;
+using Azure.Identity;
+using Azure.Sdk.Tools.PipelineWitness.ApplicationInsights;
+using Azure.Sdk.Tools.PipelineWitness.AzurePipelines;
+using Azure.Sdk.Tools.PipelineWitness.Configuration;
+using Azure.Sdk.Tools.PipelineWitness.GitHubActions;
+using Azure.Sdk.Tools.PipelineWitness.Services.WorkTokens;
+
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.Azure;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Http;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Microsoft.VisualStudio.Services.Client;
 using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.WebApi;
-using System;
-using System.Collections.Generic;
-using System.Net.NetworkInformation;
-using System.Text;
 
-[assembly: FunctionsStartup(typeof(Startup))]
+namespace Azure.Sdk.Tools.PipelineWitness;
 
-namespace Azure.Sdk.Tools.PipelineWitness
+public static class Startup
 {
-    using Azure.Sdk.Tools.PipelineWitness.Services;
-
-    using Microsoft.TeamFoundation.Build.WebApi;
-    using Microsoft.TeamFoundation.Core.WebApi;
-
-    public class Startup : FunctionsStartup
+    public static void Configure(WebApplicationBuilder builder)
     {
-        private string GetWebsiteResourceGroupEnvironmentVariable()
+        IConfigurationSection settingsSection = builder.Configuration.GetSection("PipelineWitness");
+        PipelineWitnessSettings settings = new();
+        settingsSection.Bind(settings);
+
+        builder.Services.AddLogging();
+
+        builder.Services.Configure<PipelineWitnessSettings>(settingsSection);
+        builder.Services.AddSingleton<ISecretClientProvider, SecretClientProvider>();
+        builder.Services.AddSingleton<IPostConfigureOptions<PipelineWitnessSettings>, PostConfigureKeyVaultSettings<PipelineWitnessSettings>>();
+        builder.Services.AddSingleton<IPostConfigureOptions<PipelineWitnessSettings>, PostConfigureSettings>();
+
+        builder.Services.AddApplicationInsightsTelemetry(builder.Configuration);
+        builder.Services.AddApplicationInsightsTelemetryProcessor<BlobNotFoundTelemetryProcessor>();
+        builder.Services.AddTransient<ITelemetryInitializer, ApplicationVersionTelemetryInitializer>();
+
+        builder.Services.AddSingleton<TokenCredential, DefaultAzureCredential>();
+
+        builder.Services.AddAzureClients(azureBuilder =>
         {
-            var websiteResourceGroupEnvironmentVariable = Environment.GetEnvironmentVariable("WEBSITE_RESOURCE_GROUP");
-            return websiteResourceGroupEnvironmentVariable;
-        }
+            azureBuilder.UseCredential(provider => provider.GetRequiredService<TokenCredential>());
+            azureBuilder.AddCosmosServiceClient(new Uri(settings.CosmosAccountUri));
+            azureBuilder.AddBlobServiceClient(new Uri(settings.BlobStorageAccountUri));
+            azureBuilder.AddQueueServiceClient(new Uri(settings.QueueStorageAccountUri))
+                .ConfigureOptions(o => o.MessageEncoding = Storage.Queues.QueueMessageEncoding.Base64);
+        });
 
-        private string GetBuildBlobStorageEnvironmentVariable()
+        builder.Services.AddSingleton<IAsyncLockProvider>(provider => new CosmosAsyncLockProvider(provider.GetRequiredService<CosmosClient>(), settings.CosmosDatabase, settings.CosmosAsyncLockContainer));
+        builder.Services.AddTransient(CreateVssConnection);
+
+        builder.Services.AddTransient<AzurePipelinesProcessor>();
+        builder.Services.AddTransient<BuildCompleteQueue>();
+        builder.Services.AddHostedService<BuildCompleteQueueWorker>(settings.BuildCompleteWorkerCount);
+
+        builder.Services.AddSingleton<GitHubClientFactory>();
+        builder.Services.AddTransient<GitHubActionProcessor>();
+        builder.Services.AddTransient<RunCompleteQueue>();
+        builder.Services.AddHostedService<RunCompleteQueueWorker>(settings.GitHubActionRunsWorkerCount);
+
+        builder.Services.AddHostedService<AzurePipelinesBuildDefinitionWorker>();
+        builder.Services.AddHostedService<MissingGitHubActionsWorker>();
+        builder.Services.AddHostedService<MissingAzurePipelineRunsWorker>();
+    }
+
+    private static void AddHostedService<T>(this IServiceCollection services, int instanceCount) where T : class, IHostedService
+    {
+        for (int i = 0; i < instanceCount; i++)
         {
-            var environmentVariable = Environment.GetEnvironmentVariable("BUILD_BLOB_STORAGE_URI");
-            return environmentVariable;
+            services.AddSingleton<IHostedService, T>();
         }
+    }
 
-        public override void Configure(IFunctionsHostBuilder builder)
-        {
-            var websiteResourceGroupEnvironmentVariable = GetWebsiteResourceGroupEnvironmentVariable();
-            var buildBlobStorageUri = GetBuildBlobStorageEnvironmentVariable();
+    private static void AddCosmosServiceClient<TBuilder>(this TBuilder builder, Uri serviceUri) where TBuilder : IAzureClientFactoryBuilderWithCredential
+    {
+        builder.RegisterClientFactory((CosmosClientOptions options, TokenCredential cred) => new CosmosClient(serviceUri.AbsoluteUri, cred, options));
+    }
 
-            builder.Services.AddAzureClients(builder =>
-            {
-                var keyVaultUri = new Uri($"https://{websiteResourceGroupEnvironmentVariable}.vault.azure.net/");
-                builder.AddSecretClient(keyVaultUri);
+    private static VssConnection CreateVssConnection(IServiceProvider provider)
+    {
+        Uri organizationUrl = new("https://dev.azure.com/azure-sdk");
+        TokenCredential azureCredential = provider.GetRequiredService<TokenCredential>();
+        VssAzureIdentityCredential vssCredential = new(azureCredential);
+        VssHttpRequestSettings settings = VssClientHttpRequestSettings.Default.Clone();
 
-                builder.AddBlobServiceClient(new Uri(buildBlobStorageUri));
-            });
-
-            builder.Services.AddSingleton<CosmosClient>(provider =>
-            {
-                var secretClient = provider.GetService<SecretClient>();
-                KeyVaultSecret secret = secretClient.GetSecret("cosmosdb-primary-authorization-key");
-                var accountEndpoint = $"https://{websiteResourceGroupEnvironmentVariable}.documents.azure.com";
-
-                // Let's see how this goes. Been having trouble with Cosmos and
-                // and TCP connection limits in Azure Functions. If this persists
-                // after this refactoring then the next step is to either switch
-                // to gateway mode or limit the direct connections somehow.
-                var cosmosClient = new CosmosClient(
-                    accountEndpoint,
-                    secret.Value,
-                    new CosmosClientOptions()
-                    {
-                        Diagnostics = {
-                            IsLoggingEnabled = false // HACK: https://github.com/Azure/azure-cosmos-dotnet-v3/issues/1592 
-                                                     //       It should be safe to remove these options post 4.0.0-preview.3
-                        }
-                    }
-                    );
-
-                return cosmosClient;
-            });
-
-            builder.Services.AddSingleton<VssConnection>(provider =>
-            {
-                var secretClient = provider.GetService<SecretClient>();
-                KeyVaultSecret secret = secretClient.GetSecret("azure-devops-personal-access-token");
-                var credential = new VssBasicCredential("nobody", secret.Value);
-                var connection = new VssConnection(new Uri("https://dev.azure.com/azure-sdk"), credential);
-                return connection;
-            });
-
-            builder.Services.AddSingleton(provider => provider.GetRequiredService<VssConnection>().GetClient<ProjectHttpClient>());
-            builder.Services.AddSingleton(provider => provider.GetRequiredService<VssConnection>().GetClient<BuildHttpClient>());
-
-            builder.Services.AddLogging();
-            builder.Services.AddMemoryCache();
-            builder.Services.AddSingleton<RunProcessor>();
-            builder.Services.AddSingleton<BlobUploadProcessor>();
-            builder.Services.AddSingleton<BuildLogProvider>();
-            builder.Services.AddSingleton<IFailureAnalyzer, FailureAnalyzer>();
-            builder.Services.AddSingleton<IFailureClassifier, AzuriteInstallFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, CancelledTaskClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, CosmosDbEmulatorStartFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, AzurePipelinesPoolOutageClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, PythonPipelineTestFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, JavaScriptLiveTestFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, TestResourcesDeploymentFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, DotnetPipelineTestFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, JavaPipelineTestFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, JsSamplesExecutionFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, JsDevFeedPublishingFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, DownloadSecretsFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, GitCheckoutFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, AzuriteInstallFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, MavenBrokenPipeFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, CodeSigningFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, AzureArtifactsServiceUnavailableClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, DnsResolutionFailureClassifier>();
-            builder.Services.AddSingleton<IFailureClassifier, CacheFailureClassifier>();
-        }
+        return new VssConnection(organizationUrl, vssCredential, settings);
     }
 }

@@ -11,9 +11,10 @@ import {
 import { ExampleRule, getRuleValidator } from 'oav/dist/lib/generator/exampleRule'
 import { JsonLoader } from 'oav/dist/lib/swagger/jsonLoader'
 import { LiveRequest } from 'oav/dist/lib/liveValidation/operationValidator'
-import { SpecItem } from '../responser'
-import { logger } from '../../common/utils'
+import { isNullOrUndefined, logger, setStringIfExist } from '../../common/utils'
+import { mockedResourceType } from '../../common/constants'
 import { parse as parseUrl } from 'url'
+import { xmsAzureResource } from 'oav/dist/lib/util/constants'
 import Mocker from './mocker'
 
 export default class SwaggerMocker {
@@ -39,34 +40,61 @@ export default class SwaggerMocker {
         this.exampleRule = exampleRule
     }
 
-    public mockForExample(
-        example: any,
-        specItem: SpecItem,
-        spec: any,
-        rp: string,
-        liveRequest: LiveRequest
-    ) {
-        this.spec = spec
-        if (Object.keys(example.responses).length === 0) {
-            for (const statusCode of Object.keys(specItem.content.responses)) {
-                if (statusCode !== 'default') {
-                    example.responses[`${statusCode}`] = {}
-                }
-            }
-        }
-        example.parameters = this.mockRequest(example.parameters, specItem.content.parameters, rp)
-        example.responses = this.mockResponse(example.responses, specItem)
-        this.patchResourceId(example.responses, liveRequest)
+    public patchExampleResponses(example: any, liveRequest: LiveRequest) {
+        this.patchResourceIdAndType(example.responses, liveRequest)
         this.patchUserAssignedIdentities(example.responses, liveRequest)
+    }
+
+    private isValidId(id: string): boolean {
+        if (isNullOrUndefined(id) || id.indexOf(mockedResourceType) >= 0) return false
+        // is valid id if start with '/' and there is no special chars
+        const segments = id.split('/')
+        const guidPattern = new RegExp(
+            '/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i'
+        )
+        if (
+            segments.length < 3 ||
+            (segments[1].toLowerCase() === 'subscriptions' && !guidPattern.test(segments[2]))
+        )
+            return false
+        return id.match(/^\/.+/) !== null && id.match(/[{}[]()]+/) === null
+    }
+
+    private isValidType(t: string): boolean {
+        if (isNullOrUndefined(t) || t === mockedResourceType) return false
+        // is valid type if there is '.' and there is no special chars
+        return t.match(/\./) !== null && t.match(/[{}[]()]+/) === null
     }
 
     /**
      * Replaces mock resource IDs with IDs that match current resource.
      */
-    private patchResourceId(responses: any, liveRequest: LiveRequest) {
+    public patchResourceIdAndType(responses: any, liveRequest: LiveRequest) {
         const url = parseUrl(liveRequest.url)
+
+        const pathElements = (url.pathname || '').split('/')
+        let resourceType = ''
+        let providerIdx = pathElements.length - 2
+        for (; providerIdx > 0; providerIdx--) {
+            if (
+                providerIdx % 2 === 1 &&
+                pathElements[providerIdx].match(/providers/i) &&
+                pathElements[providerIdx + 1].match(/microsoft\..+/i)
+            ) {
+                resourceType = pathElements[providerIdx + 1]
+                break
+            }
+        }
+        if (providerIdx > 0) {
+            for (let i = providerIdx + 2; i < pathElements.length; i += 2) {
+                resourceType = `${resourceType}/${pathElements[i]}`
+            }
+        } else {
+            resourceType = mockedResourceType
+        }
+
         Object.keys(responses).forEach((key) => {
-            if (responses[key]?.body?.id) {
+            if (responses[key]?.body?.id && !this.isValidId(responses[key].body.id)) {
                 // put
                 if (liveRequest.method.toLowerCase() === 'put') {
                     responses[key].body.id = url.pathname
@@ -79,15 +107,24 @@ export default class SwaggerMocker {
                     responses[key].body.id = url.pathname
                 }
             }
+            if (!this.isValidType(responses[key]?.body?.type))
+                setStringIfExist(responses[key]?.body, 'type', resourceType)
+
             // get(list)
-            if (responses[key]?.body?.value?.length) {
-                responses[key]?.body?.value?.forEach((item: any) => {
-                    if (item.id) {
-                        const resourceName = item.name || 'resourceName'
-                        url.pathname = `${url.pathname}/${resourceName}`
-                        item.id = url.pathname
-                    }
-                })
+            for (const arr of [
+                responses[key]?.body?.value /*pagable list*/,
+                responses[key]?.body /*non-pagable list*/
+            ]) {
+                if (Array.isArray(arr) && arr.length) {
+                    arr.forEach((item: any) => {
+                        if (item.id && !this.isValidId(item.id)) {
+                            const resourceName = item.name || 'resourceName'
+                            item.id = `${url.pathname}/${resourceName}`
+                        }
+                        if (!this.isValidType(item.type))
+                            setStringIfExist(item, 'type', resourceType)
+                    })
+                }
             }
         })
     }
@@ -106,17 +143,23 @@ export default class SwaggerMocker {
         pathElements: Record<string, string>,
         inUserAssignedIdentities = false
     ): any {
+        if (isNullOrUndefined(obj)) return obj
         if (Array.isArray(obj)) {
             return obj.map((x) => this.mockUserAssignedIdentities(x, pathElements))
         } else if (typeof obj === 'object') {
             const ret: Record<string, any> = {}
             // eslint-disable-next-line prefer-const
             for (let [key, item] of Object.entries(obj)) {
-                if (inUserAssignedIdentities) {
+                if (
+                    inUserAssignedIdentities &&
+                    !key.match(
+                        /\/subscriptions\/.*\/providers\/Microsoft.ManagedIdentity\/userAssignedIdentities\/.*/i
+                    )
+                ) {
                     const subscription =
                         pathElements.subscriptions || '00000000-0000-0000-0000-000000000000'
                     const resourceGroup = pathElements.subscriptions || 'mockGroup'
-                    key = `/subscriptions/${subscription}/resourceGroups/${resourceGroup}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${key}`
+                    key = `/subscriptions/${subscription}/resourceGroups/${resourceGroup}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/mocked`
                 }
                 ret[key] = this.mockUserAssignedIdentities(
                     item,
@@ -143,23 +186,7 @@ export default class SwaggerMocker {
         })
     }
 
-    public getMockCachedObj(objName: string, schema: any, isRequest: boolean) {
-        return this.mockCachedObj(objName, schema, undefined, new Set<string>(), isRequest)
-    }
-
-    private mockResponse(responseExample: any, specItem: any) {
-        for (const statusCode of Object.keys(responseExample)) {
-            const mockedResp = this.mockEachResponse(
-                statusCode,
-                responseExample[statusCode],
-                specItem
-            )
-            responseExample[statusCode] = mockedResp
-        }
-        return responseExample
-    }
-
-    private mockEachResponse(statusCode: string, responseExample: any, specItem: any) {
+    public mockEachResponse(statusCode: string, responseExample: any, specItem: any) {
         const visited = new Set<string>()
         const validator = getRuleValidator(this.exampleRule).onResponseBody
         const responseSpec = specItem.content.responses[statusCode]
@@ -268,6 +295,35 @@ export default class SwaggerMocker {
         return undefined
     }
 
+    private isAzureResource(schema: any, visited: Set<string>): boolean {
+        const definitionSpec = this.getDefSpec(schema, visited)
+
+        // check by x-ms-azure-resource
+        if (definitionSpec[xmsAzureResource]) {
+            return true
+        }
+
+        // check by property id&type&name
+        const allProperties = definitionSpec.properties || {}
+        if (
+            allProperties.id?.type === 'string' &&
+            allProperties.name?.type === 'string' &&
+            allProperties.type?.type === 'string'
+        ) {
+            return true
+        }
+
+        // check parents
+        for (const parent of definitionSpec.allOf || []) {
+            const parentDefinitionSpec = this.getDefSpec(parent, visited)
+            if (this.isAzureResource(parentDefinitionSpec, visited)) {
+                return true
+            }
+        }
+
+        return false
+    }
+
     private mockObj(
         objName: string,
         schema: any,
@@ -286,7 +342,9 @@ export default class SwaggerMocker {
         example: any,
         visited: Set<string>,
         isRequest: boolean,
-        discriminatorValue: string | undefined = undefined
+        discriminatorValue: string | undefined = undefined,
+        useCache = false,
+        inAzureResource = false
     ) {
         if (!schema || typeof schema !== 'object') {
             logger.warn(`invalid schema.`)
@@ -297,12 +355,13 @@ export default class SwaggerMocker {
             return undefined
         }
         const cache = this.getCache(schema)
-        if (cache) {
+        if (useCache && cache) {
             return cache
         }
         const definitionSpec = this.getDefSpec(schema, visited)
 
         if (util.isObject(definitionSpec)) {
+            const isAzureResourceObj = this.isAzureResource(schema, visited)
             // circular inherit will not be handled
             const properties = this.getProperties(definitionSpec, visited)
             example = example || {}
@@ -319,7 +378,8 @@ export default class SwaggerMocker {
                         example,
                         discriminator,
                         isRequest,
-                        visited
+                        visited,
+                        isAzureResourceObj
                     ) || undefined
                 )
             } else {
@@ -331,14 +391,19 @@ export default class SwaggerMocker {
                             buildItemOption(properties[key])
                         )
                     } else {
-                        example[key] = this.mockCachedObj(
-                            key,
-                            properties[key],
-                            example[key],
-                            visited,
-                            isRequest,
-                            discriminatorValue
-                        )
+                        // do not mock response value with x-ms-secret
+                        if (isRequest || !properties[key]['x-ms-secret']) {
+                            example[key] = this.mockCachedObj(
+                                key,
+                                properties[key],
+                                example[key],
+                                visited,
+                                isRequest,
+                                discriminatorValue,
+                                false,
+                                isAzureResourceObj
+                            )
+                        }
                     }
                 })
             }
@@ -353,7 +418,9 @@ export default class SwaggerMocker {
                         undefined,
                         visited,
                         isRequest,
-                        discriminatorValue
+                        discriminatorValue,
+                        false,
+                        inAzureResource
                     )
                 }
             }
@@ -369,7 +436,10 @@ export default class SwaggerMocker {
             example = this.mocker.mock(definitionSpec, objName, arrItem)
         } else {
             /** type === number or integer  */
-            example = example ? example : this.mocker.mock(definitionSpec, objName)
+            example =
+                example && typeof example !== 'object'
+                    ? example
+                    : this.mocker.mock(definitionSpec, objName, undefined, inAzureResource)
         }
         // return value for primary type: string, number, integer, boolean
         // "aaaa"
@@ -397,7 +467,9 @@ export default class SwaggerMocker {
         if (requiredProperties && requiredProperties.length > 0) {
             cacheItem.required = requiredProperties
         }
-        this.mockCache.checkAndCache(schema, cacheItem)
+        if (useCache) {
+            this.mockCache.checkAndCache(schema, cacheItem)
+        }
         return cacheItem
     }
 
@@ -425,7 +497,8 @@ export default class SwaggerMocker {
         example: any,
         discriminator: string,
         isRequest: boolean,
-        visited: Set<string>
+        visited: Set<string>,
+        inAzureResource: boolean
     ): any {
         const disDetail = this.getDefSpec(schema, visited)
         if (disDetail.discriminatorMap && Object.keys(disDetail.discriminatorMap).length > 0) {
@@ -448,7 +521,8 @@ export default class SwaggerMocker {
                     {},
                     new Set<string>(),
                     isRequest,
-                    discriminatorValue
+                    discriminatorValue,
+                    inAzureResource
                 ) || undefined
             this.removeFromSet(schema, visited)
             return cacheItem

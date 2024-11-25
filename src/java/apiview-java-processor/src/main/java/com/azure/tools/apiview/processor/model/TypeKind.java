@@ -1,13 +1,15 @@
 package com.azure.tools.apiview.processor.model;
 
-import com.fasterxml.jackson.annotation.JsonValue;
-
 public enum TypeKind {
     ASSEMBLY("assembly"),     // i.e. a Jar File
     NAMESPACE("namespace"),   // i.e. a Java package
     CLASS("class"),
     INTERFACE("interface"),
     ENUM("enum"),
+    ANNOTATION("annotation"),
+    MODULE("module"),
+    MAVEN("maven"),
+    GRADLE("gradle"),
     UNKNOWN("unknown");
 
     private final String name;
@@ -16,7 +18,6 @@ public enum TypeKind {
         this.name = name;
     }
 
-    @JsonValue
     public String getName() {
         return name;
     }
@@ -29,5 +30,14 @@ public enum TypeKind {
         } else {
             return CLASS;
         }
+    }
+
+    public static TypeKind fromName(String name) {
+        for (TypeKind typeKind : TypeKind.values()) {
+            if (typeKind.getName().equals(name)) {
+                return typeKind;
+            }
+        }
+        return null;
     }
 }
